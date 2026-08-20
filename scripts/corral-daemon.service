@@ -1,0 +1,22 @@
+; Optional systemd unit template for running the corral daemon as a service
+; instead of in a tmux session. Copy to /etc/systemd/system/corral-daemon.service,
+; fill in the placeholders below, then:
+;   systemctl daemon-reload
+;   systemctl enable --now corral-daemon
+[Unit]
+Description=Corral GPU queue daemon
+After=network.target
+
+[Service]
+Type=simple
+User=REPLACE_WITH_SERVICE_USER
+Environment=CORRAL_HOME=/path/to/shared/corral_home
+; Optional: force every job's logs into one shared location instead of the
+; default (a .corral/logs/ folder inside each job's own submission directory).
+; Environment=CORRAL_LOG_DIR=/path/to/shared/corral_logs
+ExecStart=/usr/bin/env corral daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

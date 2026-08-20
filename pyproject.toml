@@ -1,0 +1,17 @@
+[project]
+name = "corral"
+version = "0.1.0"
+description = "A simple FIFO GPU job queue for a shared research server -- like Slurm, but small enough to read in an afternoon."
+requires-python = ">=3.9"
+readme = "README.md"
+dependencies = []
+
+[project.scripts]
+corral = "corral.cli:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["corral*"]
