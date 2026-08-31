@@ -1,13 +1,13 @@
 import unittest
 
-from corral.daemon import _plan_schedule
+from corral.daemon import _cap_eligible_gpus, _plan_schedule, _sort_pending
 from corral.models import Job
 
 
-def make_job(job_id, n_gpus):
+def make_job(job_id, n_gpus, priority="normal"):
     return Job(
         id=job_id, name=job_id, user="alice", n_gpus=n_gpus, cmd=["sleep", "1"], cwd="/tmp",
-        submitted_at="2026-01-01T00:00:00",
+        submitted_at="2026-01-01T00:00:00", priority=priority,
     )
 
 
@@ -108,6 +108,42 @@ class TestBoundedBackfill(unittest.TestCase):
         self.assertIn(big.id, skip_counts)
         _plan_schedule([], eligible=[0], total_gpus=8, skip_counts=skip_counts, max_skips=5)  # cancelled elsewhere
         self.assertNotIn(big.id, skip_counts)
+
+
+class TestPrioritySort(unittest.TestCase):
+    def test_urgent_job_sorted_ahead_of_earlier_normal_job(self):
+        old_normal = make_job("j1", 1, priority="normal")
+        new_urgent = make_job("j2", 1, priority="urgent")
+        self.assertEqual(_sort_pending([old_normal, new_urgent]), [new_urgent, old_normal])
+
+    def test_fifo_order_preserved_within_each_priority_tier(self):
+        u1, u2 = make_job("j1", 1, priority="urgent"), make_job("j2", 1, priority="urgent")
+        n1, n2 = make_job("j3", 1, priority="normal"), make_job("j4", 1, priority="normal")
+        self.assertEqual(_sort_pending([n2, u2, n1, u1]), [u1, u2, n1, n2])
+
+    def test_urgent_job_becomes_the_head_and_blocks_normal_jobs_behind_it(self):
+        urgent, normal = make_job("j1", 5, priority="urgent"), make_job("j2", 1, priority="normal")
+        pending = _sort_pending([normal, urgent])  # normal submitted first, but urgent goes first
+        assignments = _plan_schedule(pending, eligible=[0, 1, 2], total_gpus=8, skip_counts={}, max_skips=0)
+        self.assertEqual(assignments, [])  # urgent (the head) doesn't fit yet -- strict FIFO within its tier
+
+
+class TestReservedGpuCap(unittest.TestCase):
+    def test_no_reservation_is_a_no_op(self):
+        self.assertEqual(_cap_eligible_gpus([0, 1, 2], total_gpus=8, committed=0, reserved_gpus=0), [0, 1, 2])
+
+    def test_reservation_trims_the_free_pool(self):
+        # 3 total, 1 reserved -> capacity 2, so only the first 2 of 3 free GPUs are offered.
+        self.assertEqual(_cap_eligible_gpus([0, 1, 2], total_gpus=3, committed=0, reserved_gpus=1), [0, 1])
+
+    def test_already_committed_gpus_count_against_capacity(self):
+        # 8 total, 1 reserved -> capacity 7; 6 already committed -> only 1 more allowed.
+        self.assertEqual(_cap_eligible_gpus([0, 1, 2], total_gpus=8, committed=6, reserved_gpus=1), [0])
+
+    def test_over_capacity_from_a_newly_raised_reservation_grants_nothing_new(self):
+        # All 8 already committed, admin raises the reservation afterwards -- no new
+        # grants until enough jobs finish to bring committed back under capacity.
+        self.assertEqual(_cap_eligible_gpus([], total_gpus=8, committed=8, reserved_gpus=2), [])
 
 
 if __name__ == "__main__":

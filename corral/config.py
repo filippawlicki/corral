@@ -59,6 +59,25 @@ BACKFILL_MAX_SKIPS = int(os.environ.get("CORRAL_BACKFILL_MAX_SKIPS", "5"))
 # before the daemon sweeps it away. COMPLETED/FAILED records are never swept.
 CANCELLED_RETENTION_SEC = int(os.environ.get("CORRAL_CANCELLED_RETENTION_SEC", "600"))
 
+# Unlike everything else above, this is deliberately NOT an env var: it needs
+# to be changeable while the daemon is already running, with no restart. It's
+# a plain-text file the daemon re-reads every poll -- `corral reserve` writes
+# it. Missing or unparseable means 0 (nothing reserved).
+RESERVED_GPUS_PATH = SPOOL_DIR / "reserved_gpus"
+
+
+def reserved_gpus() -> int:
+    try:
+        return max(0, int(RESERVED_GPUS_PATH.read_text().strip()))
+    except (FileNotFoundError, ValueError):
+        return 0
+
+
+def set_reserved_gpus(n: int) -> None:
+    tmp = RESERVED_GPUS_PATH.with_suffix(".tmp")
+    tmp.write_text(str(n))
+    os.replace(tmp, RESERVED_GPUS_PATH)
+
 
 def ensure_dirs() -> None:
     for d in (PENDING_DIR, GRANTED_DIR, RUNNING_DIR, DONE_DIR):

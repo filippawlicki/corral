@@ -65,12 +65,22 @@ Ctrl-C in a tmux window hits every process in the pipeline at once, including `t
 
 `CANCELLED` records are swept from `done/` after `CORRAL_CANCELLED_RETENTION_SEC` (`daemon._sweep_cancelled`); `COMPLETED`/`FAILED` records are kept forever. That asymmetry is deliberate, not an oversight.
 
-### Configuration is per-process, read once at import time
+### Configuration is per-process, read once at import time -- with one deliberate exception
 
 Everything in `corral/config.py` is read from environment variables at module import time -- there is no config file and no reload. Two consequences that matter when developing:
 
 - **Tests must patch `config` module attributes** (`patch.object(config, "PENDING_DIR", ...)`), not re-import the module or mutate env vars after the fact -- follow the pattern in any existing test file.
 - **Each long-running process reads its own environment once at startup.** The daemon and every user's launcher are separate OS processes; a config change (e.g. `CORRAL_LOG_DIR`) only takes effect for a launcher after that launcher process is restarted, not just re-exported in a shell.
+
+The GPU reservation is deliberately *not* an env var (there's no `CORRAL_RESERVED_GPUS`): `config.reserved_gpus()`/`set_reserved_gpus()` read and write a plain-text file (`spool/reserved_gpus`) instead. The daemon calls `reserved_gpus()` fresh on every poll (`daemon.run`), so `corral reserve --gpus N` takes effect on the next poll with no process restart -- the one setting in the codebase that's intentionally live-reloadable. Don't move this to an env var without also solving how an admin would change a running process's environment from outside it.
+
+### Priority is a sort, not a scheduler feature
+
+`Job.priority` (`"normal"` or `"urgent"`, set via `corral submit --urgent`) has zero representation inside `_plan_schedule` -- it doesn't know priority exists. `daemon._sort_pending` sorts the pending list (urgent first, FIFO within each tier) *before* `_plan_schedule` ever sees it; the scheduler just treats whatever order it's given as priority order, the same way it always has. If you need a third tier or a numeric priority later, that change belongs entirely in `_sort_pending`'s sort key -- resist the urge to teach `_plan_schedule` about priority directly, it doesn't need to know.
+
+### The reservation cap is a pure pre-filter, not part of `_plan_schedule`
+
+`daemon._cap_eligible_gpus(eligible, total_gpus, committed, reserved_gpus)` trims the free-GPU list *before* it reaches `_plan_schedule`, the same layering as `_sort_pending` above. `committed` is the count of GPUs already granted/running -- if raising the reservation mid-run drops available capacity below what's already committed, this returns an empty list (no new grants) rather than trying to claw back GPUs from jobs already in flight; nothing preempts a running job to satisfy a new reservation.
 
 ### tmux does not forward the calling shell's environment
 

@@ -13,6 +13,7 @@ class Job:
     cmd: list[str]
     cwd: str
     state: str = "PENDING"  # PENDING, GRANTED, RUNNING, COMPLETED, FAILED, CANCELLED
+    priority: str = "normal"  # normal, urgent
     submitted_at: str = ""
     started_at: Optional[str] = None
     finished_at: Optional[str] = None

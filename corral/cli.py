@@ -27,6 +27,10 @@ def cmd_gpus(args) -> None:
         for idx in (j.gpu_ids or []):
             reserved[idx] = j
 
+    held_back = config.reserved_gpus()
+    if held_back:
+        print(f"{held_back} GPU(s) held back by admin (see `corral reserve`) -- corral will never schedule onto them.\n")
+
     print(f"{len(gpus)} GPU(s) detected:\n")
     print(f"{'IDX':>3}  {'NAME':<22} {'MEM USED / TOTAL':>20}  STATUS")
     for g in gpus:
@@ -91,11 +95,13 @@ def cmd_submit(args) -> None:
         n_gpus=args.gpus,
         cmd=cmd,
         cwd=os.path.abspath(args.cwd or os.getcwd()),
+        priority="urgent" if args.urgent else "normal",
         submitted_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
     )
     _ensure_launcher(user)
     jobstore.write_job(job, config.PENDING_DIR)
-    print(f"submitted job {job.id} ({job.name}), requesting {job.n_gpus} GPU(s)")
+    print(f"submitted job {job.id} ({job.name}), requesting {job.n_gpus} GPU(s)"
+          + (", priority=urgent" if args.urgent else ""))
     print(f"  check status:  corral queue")
     print(f"  view log:      corral log {job.id} -f")
 
@@ -111,9 +117,10 @@ def cmd_queue(args) -> None:
         if not jobs:
             print("  (none)")
             return
-        print(f"  {'ID':<20} {'USER':<12} {'NAME':<22} {'GPUS':<5} {'STATE':<10} GPU_IDS")
+        print(f"  {'ID':<20} {'USER':<12} {'NAME':<22} {'GPUS':<5} {'PRI':<7} {'STATE':<10} GPU_IDS")
         for j in jobs:
-            print(f"  {j.id:<20} {j.user:<12} {j.name[:22]:<22} {j.n_gpus:<5} {j.state:<10} {j.gpu_ids or '-'}")
+            pri = "urgent" if j.priority == "urgent" else "-"
+            print(f"  {j.id:<20} {j.user:<12} {j.name[:22]:<22} {j.n_gpus:<5} {pri:<7} {j.state:<10} {j.gpu_ids or '-'}")
 
     _print_table("RUNNING", running)
     _print_table("GRANTED (waiting for the owner's launcher to start them)", granted)
@@ -198,6 +205,18 @@ def cmd_log(args) -> None:
             print(f.read())
 
 
+def cmd_reserve(args) -> None:
+    config.ensure_dirs()
+    if args.gpus is None:
+        print(f"{config.reserved_gpus()} GPU(s) currently held back from corral scheduling")
+        return
+    if args.gpus < 0:
+        print("error: --gpus must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    config.set_reserved_gpus(args.gpus)
+    print(f"holding back {args.gpus} GPU(s) -- takes effect on the daemon's next poll, no restart needed")
+
+
 def cmd_daemon(args) -> None:
     daemon_run(poll_interval=args.poll_interval)
 
@@ -217,6 +236,7 @@ def main() -> None:
     p.add_argument("--gpus", type=int, required=True, help="number of GPUs this job needs")
     p.add_argument("--name", type=str, default=None, help="optional job name (default: the command)")
     p.add_argument("--cwd", type=str, default=None, help="working directory for the job (default: cwd)")
+    p.add_argument("--urgent", action="store_true", help="schedule ahead of normal-priority jobs (e.g. a deadline)")
     p.add_argument("cmd", nargs=argparse.REMAINDER, help="command to run, e.g. -- python train.py")
     p.set_defaults(func=cmd_submit)
 
@@ -236,6 +256,10 @@ def main() -> None:
     p.add_argument("job_id")
     p.add_argument("-f", "--follow", action="store_true")
     p.set_defaults(func=cmd_log)
+
+    p = sub.add_parser("reserve", help="hold back N GPUs from corral scheduling, live (admin)")
+    p.add_argument("--gpus", type=int, default=None, help="GPUs to hold back; omit to show the current value")
+    p.set_defaults(func=cmd_reserve)
 
     p = sub.add_parser("daemon", help="run the scheduler daemon in the foreground (admin runs this once)")
     p.add_argument("--poll-interval", type=float, default=None)

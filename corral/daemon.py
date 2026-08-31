@@ -58,12 +58,14 @@ def _plan_schedule(
     """Pure decision function -- no tmux/filesystem I/O, only mutates
     `skip_counts` -- so it's cheap to unit-test directly.
 
-    Bounded backfill: jobs that fit launch in FIFO order. The first job that
-    doesn't fit becomes "the head" for this poll; later jobs can still
-    backfill into whatever GPUs are left over, for up to `max_skips`
-    consecutive polls of the head being blocked. Past that, every free GPU
-    is reserved for the head instead, so it can't be starved forever.
-    `max_skips=0` is plain strict FIFO.
+    `pending` is processed in the order given -- it's the caller's job to
+    order it (FIFO by submission time, with urgent jobs sorted first; see
+    `_sort_pending`). Bounded backfill: jobs that fit launch in that order.
+    The first job that doesn't fit becomes "the head" for this poll; later
+    jobs can still backfill into whatever GPUs are left over, for up to
+    `max_skips` consecutive polls of the head being blocked. Past that,
+    every free GPU is reserved for the head instead, so it can't be starved
+    forever. `max_skips=0` is plain strict FIFO.
 
     Impossible jobs (more GPUs than the server has) are always skipped and
     never become "the head".
@@ -104,6 +106,26 @@ def _plan_schedule(
             del skip_counts[jid]
 
     return assignments
+
+
+def _sort_pending(pending: list[Job]) -> list[Job]:
+    """Urgent jobs are considered before normal ones; FIFO order is preserved
+    within each priority tier. `_plan_schedule` has no notion of priority --
+    it just treats the first job in whatever order it's given as the head, so
+    sorting here is the entire mechanism.
+    """
+    return sorted(pending, key=lambda j: (0 if j.priority == "urgent" else 1, j.id))
+
+
+def _cap_eligible_gpus(eligible: list[int], total_gpus: int, committed: int, reserved_gpus: int) -> list[int]:
+    """Trims `eligible` (free GPU indices, sorted ascending) so corral never
+    holds more than `total_gpus - reserved_gpus` GPUs at once, counting
+    `committed` GPUs already granted or running. Pure, so an admin raising or
+    lowering the reservation live is trivial to unit-test without a daemon.
+    """
+    capacity = max(0, total_gpus - reserved_gpus)
+    allowed_new = max(0, capacity - committed)
+    return eligible[:allowed_new]
 
 
 def _grant_assignments(assignments: list[tuple[Job, list[int]]]) -> None:
@@ -164,8 +186,9 @@ def run(poll_interval: float | None = None) -> None:
                 del free_streak[idx]
 
         eligible = sorted(i for i, streak in free_streak.items() if streak >= config.FREE_STREAK_REQUIRED)
+        eligible = _cap_eligible_gpus(eligible, len(gpus), len(reserved), config.reserved_gpus())
 
-        pending = sorted(jobstore.list_jobs(config.PENDING_DIR), key=lambda j: j.id)
+        pending = _sort_pending(jobstore.list_jobs(config.PENDING_DIR))
         for job in pending:
             if job.n_gpus > len(gpus):
                 print(
