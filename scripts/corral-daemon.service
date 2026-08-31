@@ -1,8 +1,13 @@
 ; Optional systemd unit template for running the corral daemon as a service
-; instead of in a tmux session. Copy to /etc/systemd/system/corral-daemon.service,
-; fill in the placeholders below, then:
+; instead of in a tmux session -- sidesteps tmux's `-e`-only environment
+; forwarding (see README's Design notes). Copy to
+; /etc/systemd/system/corral-daemon.service, fill in the placeholders below, then:
 ;   systemctl daemon-reload
 ;   systemctl enable --now corral-daemon
+;
+; This only runs the scheduler -- it never launches jobs itself. Each user's
+; own `corral launcher` (auto-started by their `corral submit`) does that, in
+; their own tmux session under their own account. No service needed for it.
 [Unit]
 Description=Corral GPU queue daemon
 After=network.target

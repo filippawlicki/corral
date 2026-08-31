@@ -12,7 +12,7 @@ class Job:
     n_gpus: int
     cmd: list[str]
     cwd: str
-    state: str = "PENDING"  # PENDING, RUNNING, COMPLETED, FAILED, CANCELLED
+    state: str = "PENDING"  # PENDING, GRANTED, RUNNING, COMPLETED, FAILED, CANCELLED
     submitted_at: str = ""
     started_at: Optional[str] = None
     finished_at: Optional[str] = None

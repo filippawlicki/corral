@@ -46,12 +46,20 @@ for them** -- for a single shared machine.
   cancel actually registered instead of the job just silently vanishing. It's
   swept away automatically after `CORRAL_CANCELLED_RETENTION_SEC` (default 10
   minutes); unlike `COMPLETED`/`FAILED` records, which are kept forever.
-- **One daemon process** (`corral daemon`) owns scheduling. It polls
-  `nvidia-smi`, works out which GPUs are genuinely free, and launches the
-  oldest pending job that fits into a dedicated tmux window, with
-  `CUDA_VISIBLE_DEVICES` set to exactly the GPUs it assigned. Jobs survive
-  the submitting user logging out, an SSH disconnect, or the daemon itself
-  restarting.
+- **Scheduling and execution are two separate processes**, so the daemon
+  never has to touch another user's files. One shared `corral daemon`
+  (admin-run) polls `nvidia-smi`, works out which GPUs are genuinely free,
+  and grants them to the oldest pending job that fits -- but it only ever
+  writes JSON into its own spool, never launches anything. Each user also
+  has their own `corral launcher`, auto-started by their first `corral
+  submit` under their own OS account, which watches for jobs granted to
+  them and does the actual launching -- into their own tmux window, with
+  `CUDA_VISIBLE_DEVICES` set to exactly the GPUs it was granted. Because
+  the job process is genuinely that user's own process, every file it
+  creates -- logs, checkpoints, anything -- is owned by them, not by
+  whoever happens to run the daemon. See [Design notes](#design-notes) for
+  why this is split this way. Jobs survive the submitting user logging
+  out, an SSH disconnect, or either process restarting.
 - **Scheduling is FIFO with bounded backfill.** The oldest pending job (the
   "head") gets first priority, but if it can't run yet, a later, smaller job
   is allowed to run in its place using GPUs the head doesn't need -- for up
@@ -59,9 +67,8 @@ for them** -- for a single shared machine.
   Past that, all newly-freed GPUs are reserved for the head alone until it
   can launch, so it's never starved indefinitely by a steady stream of
   smaller jobs behind it. Set `CORRAL_BACKFILL_MAX_SKIPS=0` for plain strict
-  FIFO instead (the head always blocks everything immediately -- the
-  original, simpler behavior, if you'd rather have that guarantee than the
-  extra utilization).
+  FIFO instead -- the head always blocks everything immediately, if you'd
+  rather have that guarantee than the extra utilization.
 - **A GPU only counts as free** if (a) `nvidia-smi` reports it under a
   memory threshold, (b) it isn't already assigned to a job the daemon is
   tracking as running, and (c) it has looked free for 2 consecutive polls in
@@ -93,15 +100,20 @@ This does `pip install --user -e .` and prints the remaining steps. In short:
    export CORRAL_HOME=/path/to/shared/corral_home
    ```
 3. **Start the daemon once.** It coordinates scheduling for everyone; nobody
-   else needs to run it.
+   else needs to run it. tmux does **not** forward your shell's exported
+   variables into a new session by default, so pass `CORRAL_HOME` explicitly
+   with `-e` (requires tmux >= 3.2):
    ```bash
-   tmux new-session -d -s corral-daemon 'corral daemon'
+   tmux new-session -d -s corral-daemon -e CORRAL_HOME=/path/to/shared/corral_home 'corral daemon'
    ```
-   Or use the systemd unit template at `scripts/corral-daemon.service` if you'd
-   rather it survive a reboot without a login session at all.
+   Or use the systemd unit template at `scripts/corral-daemon.service` instead --
+   its `Environment=` line sets this directly, sidesteps the tmux `-e` caveat
+   entirely, and survives a reboot without a login session at all.
 4. **Everyone can now use `corral submit` / `corral queue` / `corral gpus`.**
    No per-user setup beyond step 2 and `pip install --user -e .` (or a
-   shared venv on the PATH) for the CLI itself.
+   shared venv on the PATH) for the CLI itself. The first `corral submit`
+   a user runs auto-starts their own `corral launcher` (see
+   [Design notes](#design-notes)) -- nothing else to start by hand.
 
 ## Usage
 
@@ -127,9 +139,10 @@ corral status 20260819-131055-ab12cd
 corral cancel 20260819-131055-ab12cd
 ```
 
-Every job also gets its own tmux window in the shared `corral` session, so you
-can always `tmux attach -t corral` and watch (or debug) it directly, exactly
-as if you'd launched it by hand.
+Every job also gets its own window in your personal `corral-<you>` tmux
+session, so you can always `tmux attach -t corral-<you>` and watch (or debug)
+it directly, exactly as if you'd launched it by hand. (Only your own jobs are
+in there -- everyone's launcher, and tmux session, is separate.)
 
 By default (see `CORRAL_LOG_DIR` below), job logs land in a `.corral/`
 folder inside whatever directory you ran `corral submit` from -- add
@@ -144,8 +157,8 @@ nothing to edit in the source.
 | Variable | Default | Meaning |
 |---|---|---|
 | `CORRAL_HOME` | `~/.corral` | Root of the spool directory. **Must be a shared path for a multi-user install.** |
-| `CORRAL_LOG_DIR` | *(unset)* | Where job `.log`/`.exitcode` files are written. If unset, each job's logs default to a `.corral/logs/` folder inside the directory it was submitted from. Set this to force every job's logs into one shared location instead. Read by the daemon, not the submitting client -- see [Design notes](#design-notes). |
-| `CORRAL_TMUX_SESSION` | `corral` | tmux session jobs are launched into. |
+| `CORRAL_LOG_DIR` | *(unset)* | Where job `.log`/`.exitcode` files are written. If unset, each job's logs default to a `.corral/logs/` folder inside the directory it was submitted from. Set this to force every job's logs into one shared location instead. Read by each user's own launcher, not the central daemon -- see [Design notes](#design-notes). |
+| `CORRAL_TMUX_SESSION` | `corral` | Base name for per-user launcher tmux sessions -- each user's jobs run in their own `<name>-<user>`. |
 | `CORRAL_POLL_INTERVAL` | `10` | Seconds between daemon scheduling passes. |
 | `CORRAL_FREE_STREAK` | `2` | Consecutive free polls required before a GPU is scheduled onto. |
 | `CORRAL_FREE_MEM_THRESHOLD_MIB` | `512` | Memory (MiB) below which a GPU counts as "free". |
@@ -154,36 +167,36 @@ nothing to edit in the source.
 
 ## Design notes
 
-**Jobs run as the OS user who started the daemon, not the user who submitted
-them.** This avoids needing root/sudo or a sudoers policy: a true
-per-submitter identity would need privilege escalation the daemon doesn't
-have. Fine for a small trusted team sharing one server, but worth knowing
-before relying on file permissions to separate users' outputs. For real
-multi-tenant isolation, extend this with a `sudo -u <user> -- <cmd>` wrapper
-and a narrow, audited sudoers rule.
+**Jobs run as the user who submitted them, not as the daemon's OS account.**
+If jobs ran as whichever account started the daemon, that account would need
+write access into every user's own project directories for logs, and -- more
+fundamentally -- would end up owning every checkpoint and output file each
+job creates, since a job can write anywhere. No single directory grant fixes
+that. So the central `corral daemon` never launches anything: it only decides
+which GPUs a pending job gets and writes that decision into the shared spool
+(state `GRANTED`). Each user's own `corral launcher` -- running under their
+own account, auto-started by their first `corral submit` into a
+`corral-<user>` tmux session -- watches for jobs granted to them and does the
+actual launching. The job process is then genuinely that user's own process,
+so every file it creates is correctly owned, with zero ACLs, sudoers rules,
+or admin per-user setup required. Read `corral/launcher.py` if you want the
+full mechanism; it's under 100 lines.
 
-**A consequence of the above:** the daemon's OS account needs write access
-into wherever people run `corral submit` from -- by default that's each
-job's `.corral/logs/` folder, created on demand. If a user's working
-directory isn't writable by the daemon's account, that user's job launches
-fail cleanly (marked `FAILED`, other users unaffected) until this is fixed,
-two ways:
+**A consequence:** `corral cancel` on a running job sends Ctrl-C into that
+job's own `corral-<owner>` tmux session. If you're cancelling your own job,
+that's just your own tmux socket. Cancelling *someone else's* running job
+from your account won't work (you don't have access to their tmux server) --
+ask them, or use normal OS tools (`ps`/`kill`) if you have the access for it.
+That's a deliberate trade: real isolation between users' jobs, at the cost of
+any user being able to attach to and kill any other job.
 
-1. **Filesystem ACLs (recommended).** Grant the daemon's account a *default*
-   ACL scoped to wherever each user keeps their GPU-job projects -- not
-   their whole home directory:
-   ```bash
-   setfacl -R -d -m u:<daemon-account>:rwx ~alice/gpu-projects
-   setfacl -R    -m u:<daemon-account>:rwx ~alice/gpu-projects  # covers what's already there
-   ```
-   The default ACL (`-d`) means any new project directory created under
-   `gpu-projects/` later inherits the grant automatically -- set once per
-   user, no daemon execution privilege involved, just a scoped write grant.
-2. **`CORRAL_LOG_DIR`** pointed at one shared, already-writable path instead,
-   if you'd rather skip ACLs -- simpler, at the cost of logs living in one
-   shared folder rather than next to each user's project.
-
-Test with a real second OS user before rolling out either way.
+**tmux does not forward your shell's exported environment into a new
+session** (only `-e`, added in tmux 3.2, does) -- `corral submit` accounts
+for this when auto-starting your launcher, forwarding every `CORRAL_*`
+variable explicitly. If you ever start `corral daemon` or `corral launcher`
+by hand instead of letting it auto-start, remember the same thing applies:
+either pass `-e CORRAL_HOME=...` yourself, or use the systemd unit, whose
+`Environment=` line doesn't have this problem.
 
 **FIFO with bounded backfill.** See "How it works" above for the mechanism.
 One flip side worth knowing: once the reservation kicks in, a big job that's
@@ -199,9 +212,10 @@ cluster.
 
 Stdlib `unittest` only -- no test-time dependencies, consistent with the rest
 of the project. Covers job persistence, GPU-output parsing, the tmux command
-construction (including the Ctrl-C/`tee` interaction), and the scheduler's
+construction (including the Ctrl-C/`tee` interaction), the scheduler's
 backfill decision logic (`daemon._plan_schedule`) directly and exhaustively,
-without needing real GPUs or a real tmux server:
+and the launcher's launch/reap logic, all without needing real GPUs or a
+real tmux server:
 
 ```bash
 PYTHONPATH=. python3 -m unittest discover -s tests -v
@@ -216,7 +230,8 @@ corral/
     jobstore.py        job persistence (JSON files, atomic writes)
     models.py          the Job dataclass
     tmux_exec.py        launches a job's command in a tmux window
-    daemon.py          the scheduler loop (FIFO + bounded backfill)
+    daemon.py          the scheduler (FIFO + bounded backfill) -- grants GPUs, never launches
+    launcher.py        per-user launcher -- launches/reaps that user's own granted jobs
     cli.py             the `corral` command
   tests/             unit tests (stdlib unittest, no real GPU/tmux needed)
   scripts/

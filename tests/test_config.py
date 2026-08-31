@@ -23,5 +23,12 @@ class TestLogDirFor(unittest.TestCase):
         self.assertNotEqual(a, b)
 
 
+class TestLauncherSession(unittest.TestCase):
+    def test_different_users_get_different_sessions(self):
+        with patch.object(config, "TMUX_SESSION", "corral"):
+            self.assertEqual(config.launcher_session("alice"), "corral-alice")
+            self.assertNotEqual(config.launcher_session("alice"), config.launcher_session("bob"))
+
+
 if __name__ == "__main__":
     unittest.main()

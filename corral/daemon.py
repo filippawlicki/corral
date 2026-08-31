@@ -1,8 +1,10 @@
 """The scheduler daemon. One instance runs for the whole server (an admin
-starts it once, in tmux or as a systemd service); every user's `corral submit`
-just drops a JSON file in the shared spool directory for this process to pick
-up. Scheduling policy (FIFO with bounded backfill) is documented on
-`_plan_schedule` below.
+starts it once, in tmux or as a systemd service). It only ever reads and
+writes JSON files in the shared spool -- it decides which GPUs a job gets,
+but never launches anything and never touches a user's own files. Each
+user's `corral launcher` (see `corral/launcher.py`) does the actual
+launching, running entirely under that user's own OS account. Scheduling
+policy (FIFO with bounded backfill) is documented on `_plan_schedule` below.
 """
 from __future__ import annotations
 
@@ -11,9 +13,8 @@ import os
 import signal
 import sys
 import time
-from pathlib import Path
 
-from . import config, gpu, jobstore, tmux_exec
+from . import config, gpu, jobstore
 from .models import Job
 
 
@@ -31,33 +32,6 @@ def _acquire_lock():
     lock_file.write(str(os.getpid()))
     lock_file.flush()
     return lock_file  # keep a reference alive for the life of the process
-
-
-def _reap_running(running: dict[str, Job]) -> None:
-    for job_id in list(running):
-        job = running[job_id]
-        # The exitcode file always lives alongside the log file, wherever that is.
-        log_dir_path = Path(job.log_path)
-        ec_path = log_dir_path.with_name(f"{job_id}.exitcode")
-        if not ec_path.exists():
-            continue
-        try:
-            exit_code = int(ec_path.read_text().strip())
-        except ValueError:
-            exit_code = -1
-        job.exit_code = exit_code
-        # `corral cancel` drops this sentinel before interrupting a running job,
-        # so we record CANCELLED here regardless of the process's actual exit code.
-        cancel_marker = log_dir_path.with_name(f"{job_id}.cancelled")
-        if cancel_marker.exists():
-            job.state = "CANCELLED"
-            cancel_marker.unlink(missing_ok=True)
-        else:
-            job.state = "COMPLETED" if exit_code == 0 else "FAILED"
-        job.finished_at = time.strftime("%Y-%m-%dT%H:%M:%S")
-        jobstore.move_job(job, config.RUNNING_DIR, config.DONE_DIR)
-        print(f"[corral] job {job_id} ({job.name}) finished: state={job.state}, exit={exit_code}, GPUs {job.gpu_ids} freed")
-        del running[job_id]
 
 
 def _sweep_cancelled() -> None:
@@ -132,36 +106,12 @@ def _plan_schedule(
     return assignments
 
 
-def _launch(job: Job, gpu_ids: list[int]) -> None:
-    job.gpu_ids = gpu_ids
-    job.state = "RUNNING"
-    job.started_at = time.strftime("%Y-%m-%dT%H:%M:%S")
-    log_dir = config.log_dir_for(job.cwd)
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"{job.id}.log"
-    exitcode_path = log_dir / f"{job.id}.exitcode"
-    job.log_path = str(log_path)
-    tmux_exec.launch(job.id, gpu_ids, job.cmd, job.cwd, str(log_path), str(exitcode_path))
-    jobstore.move_job(job, config.PENDING_DIR, config.RUNNING_DIR)
-    print(f"[corral] launched job {job.id} ({job.name}) on GPUs {gpu_ids} for user={job.user}")
-
-
-def _launch_assignments(assignments: list[tuple[Job, list[int]]], running: dict[str, Job]) -> None:
+def _grant_assignments(assignments: list[tuple[Job, list[int]]]) -> None:
     for job, chosen in assignments:
-        try:
-            _launch(job, chosen)
-            running[job.id] = job
-        except Exception as e:
-            # A launch failure must never take down scheduling for every other
-            # job on the server (see README's Design notes) -- fail just this one.
-            job.state = "FAILED"
-            job.finished_at = time.strftime("%Y-%m-%dT%H:%M:%S")
-            jobstore.move_job(job, config.PENDING_DIR, config.DONE_DIR)
-            print(
-                f"[corral] ERROR: failed to launch job {job.id} ({job.name}): {e} -- "
-                f"marked FAILED, GPUs {chosen} released back to the pool.",
-                file=sys.stderr,
-            )
+        job.gpu_ids = chosen
+        job.state = "GRANTED"
+        jobstore.move_job(job, config.PENDING_DIR, config.GRANTED_DIR)
+        print(f"[corral] granted job {job.id} ({job.name}) GPUs {chosen} for user={job.user} -- their launcher will start it")
 
 
 def run(poll_interval: float | None = None) -> None:
@@ -169,27 +119,19 @@ def run(poll_interval: float | None = None) -> None:
     lock_file = _acquire_lock()  # noqa: F841 -- held for the process lifetime
     poll_interval = poll_interval or config.POLL_INTERVAL_SEC
 
-    # Resume tracking of jobs already RUNNING on disk from a previous daemon instance
-    # (e.g. after a restart). Their GPUs stay reserved until an exitcode file appears --
-    # they are never relaunched.
-    running: dict[str, Job] = {j.id: j for j in jobstore.list_jobs(config.RUNNING_DIR)}
-    if running:
-        print(f"[corral] resuming tracking of {len(running)} already-running job(s)")
-
     free_streak: dict[int, int] = {}
     backfill_skip_counts: dict[str, int] = {}
     print(f"[corral] daemon started, pid={os.getpid()}, spool={config.SPOOL_DIR}, poll={poll_interval}s")
 
     def _shutdown(signum, frame):
-        print("[corral] shutdown signal received -- exiting. Running jobs are unaffected, "
-              "they keep running in their own tmux windows; restart the daemon to resume tracking them.")
+        print("[corral] shutdown signal received -- exiting. Granted/running jobs are unaffected, "
+              "each user's own launcher keeps tracking them; restart the daemon to resume scheduling.")
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
     while True:
-        _reap_running(running)
         _sweep_cancelled()
 
         try:
@@ -199,12 +141,17 @@ def run(poll_interval: float | None = None) -> None:
             time.sleep(poll_interval)
             continue
 
-        # A GPU already assigned to a job we're tracking as RUNNING is never eligible,
-        # regardless of what nvidia-smi says -- a freshly-launched job's memory usage
-        # ramps up gradually during weight loading and can look "free" for its first
-        # poll or two, so relying on nvidia-smi alone can double-book a GPU.
+        # GPUs already granted or running are never eligible, regardless of what
+        # nvidia-smi says -- a freshly-launched job's memory usage ramps up
+        # gradually during weight loading and can look "free" for its first poll
+        # or two, so relying on nvidia-smi alone can double-book a GPU. Re-reading
+        # from disk each poll (rather than keeping in-memory state) keeps this
+        # correct even though launchers, not this process, move jobs in and out
+        # of these directories.
         reserved = set()
-        for j in running.values():
+        for j in jobstore.list_jobs(config.GRANTED_DIR):
+            reserved.update(j.gpu_ids or [])
+        for j in jobstore.list_jobs(config.RUNNING_DIR):
             reserved.update(j.gpu_ids or [])
 
         seen_this_poll = set()
@@ -229,6 +176,6 @@ def run(poll_interval: float | None = None) -> None:
                 )
 
         assignments = _plan_schedule(pending, eligible, len(gpus), backfill_skip_counts, config.BACKFILL_MAX_SKIPS)
-        _launch_assignments(assignments, running)
+        _grant_assignments(assignments)
 
         time.sleep(poll_interval)

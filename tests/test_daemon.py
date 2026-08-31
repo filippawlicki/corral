@@ -5,27 +5,23 @@ from pathlib import Path
 from unittest.mock import patch
 
 from corral import config, jobstore
-from corral.daemon import _launch_assignments, _reap_running, _sweep_cancelled
+from corral.daemon import _grant_assignments, _sweep_cancelled
 from corral.models import Job
 
 
-def make_running_job(job_id, log_path):
-    return Job(
-        id=job_id, name=job_id, user="alice", n_gpus=1, cmd=["sleep", "1"], cwd="/tmp",
-        submitted_at="2026-01-01T00:00:00", started_at="2026-01-01T00:00:00",
-        state="RUNNING", gpu_ids=[0], log_path=log_path,
-    )
+class TestGrantAssignments(unittest.TestCase):
+    """The daemon only ever writes JSON into its own shared spool -- it never
+    touches tmux or a user's own files, so granting a job GPUs has no failure
+    mode tied to that job's owner (see corral/launcher.py for the code that
+    actually launches jobs, and can fail per-user)."""
 
-
-class TestReapRunning(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         base = Path(self._tmp.name)
-        self.running_dir, self.done_dir, self.log_dir = base / "running", base / "done", base / "logs"
-        self.log_dir.mkdir(parents=True)
+        self.pending_dir, self.granted_dir = base / "pending", base / "granted"
         self._patches = [
-            patch.object(config, "RUNNING_DIR", self.running_dir),
-            patch.object(config, "DONE_DIR", self.done_dir),
+            patch.object(config, "PENDING_DIR", self.pending_dir),
+            patch.object(config, "GRANTED_DIR", self.granted_dir),
         ]
         for p in self._patches:
             p.start()
@@ -35,38 +31,19 @@ class TestReapRunning(unittest.TestCase):
             p.stop()
         self._tmp.cleanup()
 
-    def test_not_reaped_until_exitcode_file_appears(self):
-        job = make_running_job("j1", str(self.log_dir / "j1.log"))
-        running = {"j1": job}
-        _reap_running(running)
-        self.assertIn("j1", running)
-        self.assertFalse((self.done_dir / "j1.json").exists())
+    def test_granted_job_moves_to_granted_dir_with_gpu_ids_and_state(self):
+        job = Job(id="j1", name="j1", user="alice", n_gpus=1, cmd=["echo"], cwd="/tmp",
+                   submitted_at="2026-01-01T00:00:00")
+        jobstore.write_job(job, self.pending_dir)
 
-    def test_reaped_as_completed_on_zero_exit(self):
-        (self.log_dir / "j1.exitcode").write_text("0")
-        job = make_running_job("j1", str(self.log_dir / "j1.log"))
-        running = {"j1": job}
-        _reap_running(running)
-        self.assertNotIn("j1", running)
-        self.assertEqual(job.state, "COMPLETED")
-        self.assertTrue((self.done_dir / "j1.json").exists())
+        _grant_assignments([(job, [0, 1])])
 
-    def test_reaped_as_failed_on_nonzero_exit(self):
-        (self.log_dir / "j1.exitcode").write_text("1")
-        job = make_running_job("j1", str(self.log_dir / "j1.log"))
-        running = {"j1": job}
-        _reap_running(running)
-        self.assertEqual(job.state, "FAILED")
-        self.assertEqual(job.exit_code, 1)
-
-    def test_cancel_sentinel_forces_cancelled_state_regardless_of_exit_code(self):
-        (self.log_dir / "j1.exitcode").write_text("141")  # e.g. SIGPIPE from an interrupted job
-        (self.log_dir / "j1.cancelled").touch()
-        job = make_running_job("j1", str(self.log_dir / "j1.log"))
-        running = {"j1": job}
-        _reap_running(running)
-        self.assertEqual(job.state, "CANCELLED")
-        self.assertFalse((self.log_dir / "j1.cancelled").exists())  # sentinel cleaned up
+        self.assertEqual(job.state, "GRANTED")
+        self.assertEqual(job.gpu_ids, [0, 1])
+        self.assertFalse((self.pending_dir / "j1.json").exists())
+        granted = jobstore.read_job(self.granted_dir / "j1.json")
+        self.assertEqual(granted.state, "GRANTED")
+        self.assertEqual(granted.gpu_ids, [0, 1])
 
 
 class TestSweepCancelled(unittest.TestCase):
@@ -109,57 +86,6 @@ class TestSweepCancelled(unittest.TestCase):
         self._write_done("j1", "COMPLETED", ancient_ts)
         _sweep_cancelled()
         self.assertTrue((self.done_dir / "j1.json").exists())
-
-
-class TestLaunchAssignmentsResilience(unittest.TestCase):
-    """A single job's launch failure (e.g. the daemon's OS user can't write into
-    that job's own submission directory) must not crash the daemon or block other
-    jobs in the same batch from launching -- see README's admin setup notes."""
-
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        base = Path(self._tmp.name)
-        self.pending_dir, self.done_dir = base / "pending", base / "done"
-        self._patches = [
-            patch.object(config, "PENDING_DIR", self.pending_dir),
-            patch.object(config, "DONE_DIR", self.done_dir),
-        ]
-        for p in self._patches:
-            p.start()
-
-    def tearDown(self):
-        for p in self._patches:
-            p.stop()
-        self._tmp.cleanup()
-
-    def test_failed_launch_marks_job_failed_without_raising(self):
-        job = Job(id="j1", name="j1", user="alice", n_gpus=1, cmd=["echo"], cwd="/no/such/dir",
-                   submitted_at="2026-01-01T00:00:00")
-        running = {}
-        with patch("corral.daemon._launch", side_effect=PermissionError("denied")):
-            _launch_assignments([(job, [0])], running)  # must not raise
-        self.assertNotIn("j1", running)
-        self.assertEqual(job.state, "FAILED")
-        self.assertTrue((self.done_dir / "j1.json").exists())
-
-    def test_one_failure_does_not_block_other_jobs_in_the_same_batch(self):
-        bad = Job(id="bad", name="bad", user="alice", n_gpus=1, cmd=["echo"], cwd="/tmp",
-                   submitted_at="2026-01-01T00:00:00")
-        good = Job(id="good", name="good", user="alice", n_gpus=1, cmd=["echo"], cwd="/tmp",
-                    submitted_at="2026-01-01T00:00:00")
-        running = {}
-
-        def fake_launch(job, gpu_ids):
-            if job.id == "bad":
-                raise PermissionError("denied")
-            job.state = "RUNNING"
-
-        with patch("corral.daemon._launch", side_effect=fake_launch):
-            _launch_assignments([(bad, [0]), (good, [1])], running)
-
-        self.assertNotIn("bad", running)
-        self.assertIn("good", running)
-        self.assertEqual(bad.state, "FAILED")
 
 
 if __name__ == "__main__":

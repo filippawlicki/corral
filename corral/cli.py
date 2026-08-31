@@ -3,12 +3,14 @@ from __future__ import annotations
 import argparse
 import getpass
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 from . import config, gpu, jobstore
 from .daemon import run as daemon_run
+from .launcher import run as launcher_run
 from .models import Job
 from .tmux_exec import interrupt as tmux_interrupt
 
@@ -21,7 +23,7 @@ def cmd_gpus(args) -> None:
         sys.exit(1)
 
     reserved: dict[int, Job] = {}
-    for j in jobstore.list_jobs(config.RUNNING_DIR):
+    for j in jobstore.list_jobs(config.RUNNING_DIR) + jobstore.list_jobs(config.GRANTED_DIR):
         for idx in (j.gpu_ids or []):
             reserved[idx] = j
 
@@ -39,6 +41,36 @@ def cmd_gpus(args) -> None:
         print(f"{g.index:>3}  {g.name:<22} {mem:>20}  {status}")
 
 
+def _ensure_launcher(user: str) -> None:
+    """Starts this user's launcher (their own tmux session, their own OS
+    account) if it isn't already running -- so `corral submit` needs no
+    separate setup step. See README's Design notes.
+    """
+    session = config.launcher_session(user)
+    if subprocess.run(["tmux", "has-session", "-t", session], capture_output=True).returncode == 0:
+        return
+    # tmux does NOT forward the calling shell's environment into a new session
+    # by default -- without `-e` (tmux >= 3.2), the launcher would silently
+    # fall back to every CORRAL_* default instead of this user's actual config.
+    env_flags = [f for k, v in os.environ.items() if k.startswith("CORRAL_") for f in ("-e", f"{k}={v}")]
+    # Re-exec via this same interpreter/module rather than relying on a
+    # `corral` entry point being on PATH -- works regardless of install method.
+    subprocess.run(
+        ["tmux", "new-session", "-d", "-s", session, *env_flags, sys.executable, "-m", "corral.cli", "launcher"],
+        check=False,
+    )
+    time.sleep(0.3)  # give tmux a moment to fail fast if the command couldn't start at all
+    if subprocess.run(["tmux", "has-session", "-t", session], capture_output=True).returncode == 0:
+        print(f"[corral] started your launcher (tmux session '{session}') -- it runs your jobs as you")
+    else:
+        print(
+            f"[corral] warning: couldn't start your launcher automatically. Run `corral launcher` "
+            f"yourself (e.g. `tmux new-session -d -s {session} corral launcher`) or this job will "
+            f"never move past GRANTED.",
+            file=sys.stderr,
+        )
+
+
 def cmd_submit(args) -> None:
     config.ensure_dirs()
     cmd = args.cmd
@@ -51,15 +83,17 @@ def cmd_submit(args) -> None:
         print("error: --gpus must be at least 1", file=sys.stderr)
         sys.exit(1)
 
+    user = getpass.getuser()
     job = Job(
         id=jobstore.new_job_id(),
         name=args.name or os.path.basename(cmd[0]),
-        user=getpass.getuser(),
+        user=user,
         n_gpus=args.gpus,
         cmd=cmd,
         cwd=os.path.abspath(args.cwd or os.getcwd()),
         submitted_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
     )
+    _ensure_launcher(user)
     jobstore.write_job(job, config.PENDING_DIR)
     print(f"submitted job {job.id} ({job.name}), requesting {job.n_gpus} GPU(s)")
     print(f"  check status:  corral queue")
@@ -68,6 +102,7 @@ def cmd_submit(args) -> None:
 
 def cmd_queue(args) -> None:
     running = sorted(jobstore.list_jobs(config.RUNNING_DIR), key=lambda j: j.id)
+    granted = sorted(jobstore.list_jobs(config.GRANTED_DIR), key=lambda j: j.id)
     pending = sorted(jobstore.list_jobs(config.PENDING_DIR), key=lambda j: j.id)
     done = sorted(jobstore.list_jobs(config.DONE_DIR), key=lambda j: j.id)[-args.last:]
 
@@ -81,12 +116,18 @@ def cmd_queue(args) -> None:
             print(f"  {j.id:<20} {j.user:<12} {j.name[:22]:<22} {j.n_gpus:<5} {j.state:<10} {j.gpu_ids or '-'}")
 
     _print_table("RUNNING", running)
+    _print_table("GRANTED (waiting for the owner's launcher to start them)", granted)
     _print_table("PENDING (FIFO order)", pending)
     _print_table(f"RECENTLY FINISHED (last {args.last})", done)
 
 
 def _find_job(job_id: str) -> tuple[Job | None, str | None]:
-    for where, d in (("pending", config.PENDING_DIR), ("running", config.RUNNING_DIR), ("done", config.DONE_DIR)):
+    for where, d in (
+        ("pending", config.PENDING_DIR),
+        ("granted", config.GRANTED_DIR),
+        ("running", config.RUNNING_DIR),
+        ("done", config.DONE_DIR),
+    ):
         p = d / f"{job_id}.json"
         if p.exists():
             return jobstore.read_job(p), where
@@ -120,17 +161,26 @@ def cmd_cancel(args) -> None:
             f"cancelled pending job {job.id} (never started, no GPUs were reserved). "
             f"Kept as CANCELLED in `corral queue`/`status` for ~{retention_min} more minute(s)."
         )
+    elif where == "granted":
+        job.state = "CANCELLED"
+        job.finished_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+        jobstore.move_job(job, config.GRANTED_DIR, config.DONE_DIR)
+        print(
+            f"cancelled job {job.id} before its launcher started it (GPUs {job.gpu_ids} released). "
+            f"Kept as CANCELLED for ~{retention_min} more minute(s)."
+        )
     elif where == "running":
-        tmux_interrupt(job.id)
-        # Sentinel file tells the daemon this exit was a user-requested cancel,
-        # so it records CANCELLED instead of COMPLETED/FAILED once it reaps it.
+        session = config.launcher_session(job.user)
+        tmux_interrupt(job.id, session)
+        # Sentinel file tells the owner's launcher this exit was a user-requested
+        # cancel, so it records CANCELLED instead of COMPLETED/FAILED once it reaps it.
         if job.log_path:
             Path(job.log_path).with_name(f"{job.id}.cancelled").touch()
         print(
             f"sent Ctrl-C to running job {job.id} (tmux window {job.id[:30]} in session "
-            f"'{config.TMUX_SESSION}'). It will be reaped automatically once its process exits, "
+            f"'{session}'). It will be reaped automatically once its process exits, "
             f"and recorded as CANCELLED (kept for ~{retention_min} more minute(s)). "
-            f"If it doesn't stop, attach with `tmux attach -t {config.TMUX_SESSION}` and kill it by hand."
+            f"If it doesn't stop, attach with `tmux attach -t {session}` and kill it by hand."
         )
     else:
         print(f"job {job.id} already finished (state={job.state}), nothing to cancel")
@@ -150,6 +200,10 @@ def cmd_log(args) -> None:
 
 def cmd_daemon(args) -> None:
     daemon_run(poll_interval=args.poll_interval)
+
+
+def cmd_launcher(args) -> None:
+    launcher_run(poll_interval=args.poll_interval)
 
 
 def main() -> None:
@@ -186,6 +240,10 @@ def main() -> None:
     p = sub.add_parser("daemon", help="run the scheduler daemon in the foreground (admin runs this once)")
     p.add_argument("--poll-interval", type=float, default=None)
     p.set_defaults(func=cmd_daemon)
+
+    p = sub.add_parser("launcher", help="run your personal job launcher (auto-started by `corral submit`)")
+    p.add_argument("--poll-interval", type=float, default=None)
+    p.set_defaults(func=cmd_launcher)
 
     args = ap.parse_args()
     args.func(args)

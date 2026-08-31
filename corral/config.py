@@ -11,6 +11,7 @@ from pathlib import Path
 CORRAL_HOME = Path(os.environ.get("CORRAL_HOME", os.path.expanduser("~/.corral"))).resolve()
 SPOOL_DIR = CORRAL_HOME / "spool"
 PENDING_DIR = SPOOL_DIR / "pending"
+GRANTED_DIR = SPOOL_DIR / "granted"
 RUNNING_DIR = SPOOL_DIR / "running"
 DONE_DIR = SPOOL_DIR / "done"
 LOCK_PATH = SPOOL_DIR / "daemon.lock"
@@ -28,8 +29,13 @@ def log_dir_for(job_cwd: str) -> Path:
     """Resolves the log directory for a job submitted from `job_cwd`."""
     return LOG_DIR if LOG_DIR is not None else Path(job_cwd) / ".corral" / "logs"
 
-# Name of the shared tmux session the daemon launches jobs into -- one window per job.
+# Base name for per-user launcher tmux sessions -- each user's jobs run in
+# their own session, `<TMUX_SESSION>-<user>`, under their own OS account.
 TMUX_SESSION = os.environ.get("CORRAL_TMUX_SESSION", "corral")
+
+
+def launcher_session(user: str) -> str:
+    return f"{TMUX_SESSION}-{user}"
 
 # How often the daemon polls nvidia-smi and re-evaluates the queue.
 POLL_INTERVAL_SEC = float(os.environ.get("CORRAL_POLL_INTERVAL", "10"))
@@ -55,7 +61,7 @@ CANCELLED_RETENTION_SEC = int(os.environ.get("CORRAL_CANCELLED_RETENTION_SEC", "
 
 
 def ensure_dirs() -> None:
-    for d in (PENDING_DIR, RUNNING_DIR, DONE_DIR):
+    for d in (PENDING_DIR, GRANTED_DIR, RUNNING_DIR, DONE_DIR):
         d.mkdir(parents=True, exist_ok=True)
     if LOG_DIR is not None:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
