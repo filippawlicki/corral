@@ -1,4 +1,4 @@
-# Corral
+# 🪸 Corral
 
 A simple FIFO GPU job queue for a shared research server. Think Slurm, but
 small enough to read start to finish in an afternoon: no database, no
